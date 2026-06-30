@@ -14,7 +14,16 @@
   <script type="text/babel">
     const { useState, useEffect, useRef, useCallback } = React;
 
-    const STORAGE_KEY = "screener-state-v5"; // New version to clear old cache frameworks
+    // ============================================================
+    // CONFIG — put your free FMP API key here.
+    // Get one at https://site.financialmodelingprep.com/developer/docs
+    // (free tier, no card required, ~250 calls/day).
+    // The "demo" key only ever returns a fixed sample response —
+    // that's why your data looked stale on every host.
+    // ============================================================
+    const FMP_API_KEY = "YOUR_FREE_API_KEY_HERE";
+
+    const STORAGE_KEY = "screener-state-v6";
     const MAX_HISTORY = 120;
 
     const tokens = {
@@ -46,36 +55,41 @@
       return new Date().toDateString();
     }
 
-    // Scans ALL NYSE + NASDAQ equities via free full-market aggregator endpoints
+    function assertKey() {
+      if (!FMP_API_KEY || FMP_API_KEY === "YOUR_FREE_API_KEY_HERE") {
+        throw new Error("No API key set. Edit FMP_API_KEY at the top of the file with your free FMP key.");
+      }
+    }
+
+    // Real top-gainers scan across NYSE + NASDAQ
     async function fetchFreeMarketData() {
-      // Utilizing a publicly accessible free evaluation key structure 
-      const apiKey = "demo"; 
-      const url = `https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey=${apiKey}`;
-      
+      assertKey();
+      const url = `https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey=${FMP_API_KEY}`;
+
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`Market fetch failed with HTTP status code ${response.status}`);
       }
-      
+
       const data = await response.json();
-      if (!Array.isArray(data) || data.length === 0) {
-        throw new Error("Invalid or empty response structure from full market scanner.");
+      if (!Array.isArray(data)) {
+        // FMP returns an object like {"Error Message": "..."} on bad/invalid key
+        throw new Error(data["Error Message"] || "Invalid response from market scanner — check your API key.");
+      }
+      if (data.length === 0) {
+        throw new Error("Empty response — market may be closed, or check your API key.");
       }
 
-      // Filter and process the full market response array
       const scannedEquities = data
-        .filter(stock => {
-          // Keep it clean: Ensure the stock belongs to major US exchanges (NYSE / NASDAQ)
+        .filter((stock) => {
           const exchange = (stock.exchange || "").toUpperCase();
-          const matchesExchange = exchange.includes("NASDAQ") || exchange.includes("NYSE") || exchange.includes("NEW YORK STOCK EXCHANGE");
-          
-          // Exclude highly volatile sub-$2 micro penny stocks for stable options/equity tracking
+          const matchesExchange =
+            exchange.includes("NASDAQ") || exchange.includes("NYSE") || exchange.includes("NEW YORK STOCK EXCHANGE");
           return matchesExchange && stock.price > 2;
         })
-        .map(stock => {
+        .map((stock) => {
           const priceValue = parseFloat(stock.price) || 0;
           const changePct = parseFloat(stock.changesPercentage) || 0;
-          
           return {
             ticker: stock.symbol,
             name: stock.name || "US Listed Equity",
@@ -84,7 +98,6 @@
             changePct: changePct,
           };
         })
-        // Sort the entire market universe to rank top gainers down cleanly
         .sort((a, b) => b.changePct - a.changePct)
         .slice(0, 10);
 
@@ -102,8 +115,29 @@
         score: Math.min(99, Math.round(75 + stock.changePct)),
         upside_pct: Math.max(5, Math.round(15 + stock.changePct)),
         catalyst: "Broad Market Gainer Screen",
-        note: `Real-time print: $${stock.price.toFixed(2)}. Momentum surging up +${stock.changePct.toFixed(2)}% across broad market operations.`
+        note: `Real-time print: $${stock.price.toFixed(2)}. Momentum +${stock.changePct.toFixed(2)}% on the session.`,
       }));
+    }
+
+    // Real current quotes for a batch of tickers (used for performance tracking)
+    async function fetchQuotes(tickers) {
+      assertKey();
+      if (tickers.length === 0) return {};
+      const symbols = tickers.join(",");
+      const url = `https://financialmodelingprep.com/api/v3/quote/${symbols}?apikey=${FMP_API_KEY}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Quote fetch failed with HTTP status code ${response.status}`);
+      }
+      const data = await response.json();
+      if (!Array.isArray(data)) {
+        throw new Error(data["Error Message"] || "Invalid quote response — check your API key.");
+      }
+      const map = {};
+      data.forEach((q) => {
+        map[q.symbol] = q.price;
+      });
+      return map;
     }
 
     function StockScreener() {
@@ -180,7 +214,7 @@
           setHistory(nextHistory);
           persist({ results: rows, lastRun: stamp, lastRunDateKey: dateKey, history: nextHistory });
         } catch (e) {
-          setError(`Scanner Error Diagnostics: ${e.message}`);
+          setError(`Scanner Error: ${e.message}`);
         } finally {
           setLoading(false);
         }
@@ -194,24 +228,28 @@
         }
       }, [ready, lastRunDateKey, runScreen]);
 
+      // Now fetches REAL current quotes instead of simulating random moves
       const checkPerformance = useCallback(async (entry) => {
         setPerfLoading(true);
         setPerfError(null);
         try {
+          const tickers = entry.picks.map((p) => p.ticker);
+          const quoteMap = await fetchQuotes(tickers);
+
           const rows = entry.picks.map((p) => {
-            const artificialFluctuation = (Math.random() * 20) - 8; 
-            const current = p.entry_price * (1 + artificialFluctuation / 100);
-            const change_pct = ((current - p.entry_price) / p.entry_price) * 100;
+            const current = quoteMap[p.ticker];
+            const hasQuote = typeof current === "number" && !isNaN(current);
+            const change_pct = hasQuote ? ((current - p.entry_price) / p.entry_price) * 100 : null;
             return {
               ...p,
-              current_price: current,
+              current_price: hasQuote ? current : null,
               change_pct,
-              hit20: change_pct >= 20,
+              hit20: hasQuote ? change_pct >= 20 : false,
             };
           });
           setPerf({ dateKey: entry.dateKey, rows, checkedAt: new Date().toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) });
         } catch (e) {
-          setPerfError("Performance array load error.");
+          setPerfError(`Performance fetch error: ${e.message}`);
         } finally {
           setPerfLoading(false);
         }
@@ -358,8 +396,13 @@
                           disabled={perfLoading}
                           style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: tokens.ledger, color: tokens.card, fontWeight: 600, fontSize: 14 }}
                         >
-                          {perfLoading ? "Checking Live Changes..." : `Analyze Performance`}
+                          {perfLoading ? "Fetching Live Quotes..." : `Analyze Performance`}
                         </button>
+                        {perfError && (
+                          <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${tokens.loss}`, fontSize: 12, color: tokens.loss, background: "#FFF0F0", fontFamily: tokens.mono }}>
+                            {perfError}
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -379,11 +422,13 @@
                                   {r.ticker} {r.hit20 && <span style={{ color: tokens.gain }}>· Hit</span>}
                                 </div>
                                 <div style={{ fontSize: 12, color: tokens.muted, fontFamily: tokens.mono }}>
-                                  ${r.entry_price.toFixed(2)} → ${r.current_price.toFixed(2)}
+                                  {r.current_price !== null
+                                    ? `$${r.entry_price.toFixed(2)} → $${r.current_price.toFixed(2)}`
+                                    : `$${r.entry_price.toFixed(2)} → no quote`}
                                 </div>
                               </div>
                               <div style={{ fontFamily: tokens.mono, fontWeight: 700, fontSize: 15, color: changeColor(r.change_pct) }}>
-                                {r.change_pct >= 0 ? "+" : ""}{r.change_pct.toFixed(1)}%
+                                {r.change_pct !== null ? `${r.change_pct >= 0 ? "+" : ""}${r.change_pct.toFixed(1)}%` : "—"}
                               </div>
                             </div>
                           ))}
